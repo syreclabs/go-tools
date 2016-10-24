@@ -21,7 +21,7 @@ import (
 	"runtime/pprof"
 	"strings"
 
-	"golang.org/x/tools/imports"
+	"github.com/syreclabs/go-tools/imports"
 )
 
 var (

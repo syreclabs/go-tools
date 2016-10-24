@@ -36,9 +36,27 @@ var (
 // prefix into another group after 3rd-party packages.
 var LocalPrefix string
 
+// goimportsTag allows specifying preferred import when there are multiple candidate packages, e.g.
+//
+// 	// +goimports github.com/user/package
+//	// import (
+//	//	...
+//	// )
+//
+const goimportsTag = "+goimports"
+
+// preferredImport is an optional preferred import prefix parsed from goimportsTag.
+var preferredImport string
+
 // importToGroup is a list of functions which map from an import path to
 // a group number.
 var importToGroup = []func(importPath string) (num int, ok bool){
+	func(importPath string) (num int, ok bool) {
+		if preferredImport != "" && strings.HasPrefix(importPath, preferredImport) {
+			return 4, true
+		}
+		return
+	},
 	func(importPath string) (num int, ok bool) {
 		if LocalPrefix != "" && strings.HasPrefix(importPath, LocalPrefix) {
 			return 3, true
@@ -172,6 +190,13 @@ func fixImports(fset *token.FileSet, f *ast.File, filename string) (added []stri
 			return visitor
 		}
 		switch v := node.(type) {
+		case *ast.Comment:
+			if strings.Contains(v.Text, goimportsTag) {
+				parts := strings.Fields(v.Text)
+				if len(parts) > 2 {
+					preferredImport = parts[2]
+				}
+			}
 		case *ast.ImportSpec:
 			if v.Name != nil {
 				decls[v.Name.Name] = v
@@ -403,17 +428,23 @@ type pkg struct {
 	importPathShort string // vendorless import path ("net/http", "a/b")
 }
 
-// byImportPathShortLength sorts by the short import path length, breaking ties on the
-// import string itself.
-type byImportPathShortLength []*pkg
+// byImportPathPreferredAndShortLength sorts by the short import path length, giving preference
+// to paths that have preferredImport prefix.
+type byImportPathPreferredAndShortLength []*pkg
 
-func (s byImportPathShortLength) Len() int { return len(s) }
-func (s byImportPathShortLength) Less(i, j int) bool {
+func (s byImportPathPreferredAndShortLength) Len() int { return len(s) }
+func (s byImportPathPreferredAndShortLength) Less(i, j int) bool {
 	vi, vj := s[i].importPathShort, s[j].importPathShort
-	return len(vi) < len(vj) || (len(vi) == len(vj) && vi < vj)
-
+	pvi, pvj := strings.HasPrefix(vi, preferredImport), strings.HasPrefix(vj, preferredImport)
+	if pvi == pvj {
+		return len(vi) < len(vj) || (len(vi) == len(vj) && vi < vj)
+	} else {
+		return pvi && !pvj
+	}
 }
-func (s byImportPathShortLength) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s byImportPathPreferredAndShortLength) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
 
 // guarded by populateIgnoreOnce; populates ignoredDirs.
 func populateIgnore() {
@@ -724,23 +755,6 @@ func findImportGoPath(pkgName string, symbols map[string]bool, filename string) 
 		defer testMu.RUnlock()
 	}
 
-	// Fast path for the standard library.
-	// In the common case we hopefully never have to scan the GOPATH, which can
-	// be slow with moving disks.
-	if pkg, rename, ok := findImportStdlib(pkgName, symbols); ok {
-		return pkg, rename, nil
-	}
-	if pkgName == "rand" && symbols["Read"] {
-		// Special-case rand.Read.
-		//
-		// If findImportStdlib didn't find it above, don't go
-		// searching for it, lest it find and pick math/rand
-		// in GOROOT (new as of Go 1.6)
-		//
-		// crypto/rand is the safer choice.
-		return "", false, nil
-	}
-
 	// TODO(sameer): look at the import lines for other Go files in the
 	// local directory, since the user is likely to import the same packages
 	// in the current Go file.  Return rename=true when the other Go files
@@ -773,7 +787,7 @@ func findImportGoPath(pkgName string, symbols map[string]bool, filename string) 
 	// assuming that shorter package names are better than long
 	// ones.  Note that this sorts by the de-vendored name, so
 	// there's no "penalty" for vendoring.
-	sort.Sort(byImportPathShortLength(candidates))
+	sort.Sort(byImportPathPreferredAndShortLength(candidates))
 	if Debug {
 		for i, pkg := range candidates {
 			log.Printf("%s candidate %d/%d: %v", pkgName, i+1, len(candidates), pkg.importPathShort)
@@ -829,6 +843,7 @@ func findImportGoPath(pkgName string, symbols map[string]bool, filename string) 
 			}()
 		}
 	}()
+
 	for _, resc := range rescv {
 		pkg := <-resc
 		if pkg == nil {
@@ -839,6 +854,22 @@ func findImportGoPath(pkgName string, symbols map[string]bool, filename string) 
 		needsRename := path.Base(pkg.importPath) != pkgName
 		return pkg.importPathShort, needsRename, nil
 	}
+
+	// As a last resort, look in stdlib
+	if pkg, rename, ok := findImportStdlib(pkgName, symbols); ok {
+		return pkg, rename, nil
+	}
+	if pkgName == "rand" && symbols["Read"] {
+		// Special-case rand.Read.
+		//
+		// If findImportStdlib didn't find it above, don't go
+		// searching for it, lest it find and pick math/rand
+		// in GOROOT (new as of Go 1.6)
+		//
+		// crypto/rand is the safer choice.
+		return "", false, nil
+	}
+
 	return "", false, nil
 }
 
